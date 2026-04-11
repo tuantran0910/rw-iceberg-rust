@@ -1033,6 +1033,7 @@ mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            data_file: None,
         };
 
         let eq_del_scan_task = FileScanTask {
@@ -1053,6 +1054,7 @@ mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            data_file: None,
         };
 
         let file_scan_task = FileScanTask {
@@ -1073,6 +1075,7 @@ mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            data_file: None,
         };
 
         // Load the deletes - should handle both types without error

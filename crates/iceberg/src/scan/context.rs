@@ -153,6 +153,7 @@ impl ManifestEntryContext {
             case_sensitive: self.case_sensitive,
             sequence_number: self.manifest_entry.sequence_number().unwrap_or(0),
             equality_ids: self.manifest_entry.data_file().equality_ids(),
+            data_file: Some(self.manifest_entry.data_file().clone()),
         })
     }
 }

@@ -78,16 +78,12 @@ impl GoogleAuthManager {
 
         // token_source.token() returns "Bearer <access_token>"
         // Strip the prefix since authenticate() in client.rs adds "Bearer " again.
-        let token = provider
-            .token_source()
-            .token()
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Failed to obtain Google access token: {e}"),
-                )
-            })?;
+        let token = provider.token_source().token().await.map_err(|e| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Failed to obtain Google access token: {e}"),
+            )
+        })?;
         let access_token = token.strip_prefix("Bearer ").unwrap_or(&token).to_string();
         Ok(access_token)
     }

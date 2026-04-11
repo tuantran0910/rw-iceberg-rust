@@ -43,6 +43,7 @@ pub(crate) fn available_parallelism() -> NonZeroUsize {
     })
 }
 
+/// Utilities for bin packing operations.
 pub mod bin {
     use std::iter::Iterator;
     use std::marker::PhantomData;
@@ -188,6 +189,7 @@ pub mod bin {
     }
 }
 
+/// Iterator for traversing snapshot ancestors.
 pub struct Ancestors {
     next: Option<SnapshotRef>,
     get_snapshot: Box<dyn Fn(i64) -> Option<SnapshotRef> + Send>,
@@ -255,6 +257,9 @@ use crate::spec::{Manifest, ManifestFile, ManifestList, ManifestStatus, Snapshot
 pub(crate) const DEFAULT_DELETE_CONCURRENCY_LIMIT: usize = 10;
 pub(crate) const DEFAULT_LOAD_CONCURRENCY_LIMIT: usize = 16;
 
+/// Concurrency limit for loading data files during upsert operations.
+pub(crate) const DEFAULT_UPSERT_DATA_LOAD_CONCURRENCY: usize = 16;
+
 /// Concurrently loads manifest lists for the given snapshots.
 pub(crate) async fn load_manifest_lists(
     file_io: &FileIO,
@@ -294,6 +299,79 @@ pub(crate) async fn load_manifests(
             async move {
                 let manifest = manifest_file.load_manifest(&file_io).await?;
                 Ok((manifest_file, manifest))
+            }
+        })
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await
+}
+
+/// Result of reading a data file for upsert operations.
+pub(crate) struct DataFileReadResult {
+    /// The file scan task.
+    pub(crate) task: FileScanTask,
+    /// The batches read from the file.
+    pub(crate) batches: Vec<RecordBatch>,
+    /// File size in bytes if available.
+    pub(crate) file_size: Option<u64>,
+}
+
+use arrow_array::RecordBatch;
+
+use crate::arrow::ArrowReaderBuilder;
+use crate::error::{Error, ErrorKind};
+use crate::scan::{FileScanTask, FileScanTaskStream};
+
+/// Read a single data file into Arrow RecordBatches.
+///
+/// This is used by upsert operations to read target data files.
+pub async fn read_target_file(file_io: FileIO, task: FileScanTask) -> Result<Vec<RecordBatch>> {
+    let tasks: FileScanTaskStream = Box::pin(stream::iter(vec![Ok(task)]));
+    let arrow_reader = ArrowReaderBuilder::new(file_io).build();
+    let batch_stream = arrow_reader.read(tasks).map_err(|e| {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("Failed to read target file: {e}"),
+        )
+    })?;
+
+    let batches: Vec<RecordBatch> = batch_stream.try_collect().await.map_err(|e| {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("Error collecting batches: {e}"),
+        )
+    })?;
+
+    Ok(batches)
+}
+
+/// Read all matched data files concurrently for upsert operations.
+///
+/// Uses `buffer_unordered` to read files in parallel, bounded by the
+/// concurrency limit. Results are returned in completion order.
+///
+/// # Arguments
+/// * `file_io` - FileIO for reading
+/// * `tasks` - FileScanTasks to read
+/// * `concurrency` - Max concurrent reads
+pub(crate) async fn load_data_files(
+    file_io: &FileIO,
+    tasks: Vec<FileScanTask>,
+    concurrency: usize,
+) -> Result<Vec<DataFileReadResult>> {
+    let concurrency = concurrency.max(1);
+
+    stream::iter(tasks)
+        .map(|task| {
+            let file_io = file_io.clone();
+            async move {
+                let file_size = task.data_file.as_ref().map(|df| df.file_size_in_bytes);
+                let batches = read_target_file(file_io, task.clone()).await?;
+                Ok(DataFileReadResult {
+                    task,
+                    batches,
+                    file_size,
+                })
             }
         })
         .buffer_unordered(concurrency)

@@ -401,6 +401,7 @@ pub(crate) mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            data_file: None,
         };
 
         let file_scan_tasks = vec![
@@ -422,6 +423,7 @@ pub(crate) mod tests {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                data_file: None,
             },
             FileScanTask {
                 file_size_in_bytes: 0,
@@ -441,6 +443,7 @@ pub(crate) mod tests {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                data_file: None,
             },
         ];
 
@@ -507,6 +510,7 @@ pub(crate) mod tests {
                     partition_spec: None,
                     name_mapping: None,
                     case_sensitive: true,
+                    data_file: None,
                 }
                 .into(),
             ],
@@ -516,6 +520,7 @@ pub(crate) mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: true,
+            data_file: None,
         };
 
         let filter = DeleteFilter::default();

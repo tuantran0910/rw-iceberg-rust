@@ -230,13 +230,15 @@ impl HttpClient {
             })?;
 
         let config = Config::default().with_scopes(&[GCP_CLOUD_PLATFORM_SCOPE]);
-        let provider =
-            DefaultTokenSourceProvider::new_with_credentials(config, Box::new(creds))
-                .await
-                .map_err(|e| {
-                    Error::new(ErrorKind::Unexpected, "Failed to initialize GCP token provider")
-                        .with_source(e)
-                })?;
+        let provider = DefaultTokenSourceProvider::new_with_credentials(config, Box::new(creds))
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to initialize GCP token provider",
+                )
+                .with_source(e)
+            })?;
 
         // token_source.token() returns "Bearer <access_token>"
         // Strip the prefix since authenticate() adds "Bearer " again.

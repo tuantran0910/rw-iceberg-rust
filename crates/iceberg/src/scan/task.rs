@@ -93,6 +93,17 @@ pub struct FileScanTask {
 
     /// Whether this scan task should treat column names as case-sensitive when binding predicates.
     pub case_sensitive: bool,
+
+    /// The original [`DataFile`] from the manifest entry.
+    ///
+    /// Present when the task was built from a manifest entry (i.e. via `plan_files()`).
+    /// Used by write operations (e.g. upsert CoW) that need the full `DataFile` metadata
+    /// to mark old files as deleted in a new snapshot.
+    ///
+    /// Skipped during serialization/deserialization since `DataFile` uses a custom Avro serde
+    /// format; callers that round-trip tasks through serialization will see `None` here.
+    #[serde(skip)]
+    pub data_file: Option<crate::spec::DataFile>,
 }
 
 impl FileScanTask {
@@ -176,6 +187,7 @@ impl From<&DeleteFileContext> for FileScanTask {
             partition_spec: None, // TODO: pass through partition spec info
             name_mapping: None,   // TODO: implement name mapping
             case_sensitive: ctx.case_sensitive,
+            data_file: Some(ctx.manifest_entry.data_file().clone()),
         }
     }
 }

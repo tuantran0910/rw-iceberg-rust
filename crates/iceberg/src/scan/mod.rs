@@ -1842,6 +1842,7 @@ pub mod tests {
             case_sensitive: false,
             sequence_number: 0,
             equality_ids: None,
+            data_file: None,
         };
         test_fn(task);
 
@@ -1864,6 +1865,7 @@ pub mod tests {
             case_sensitive: false,
             sequence_number: 0,
             equality_ids: None,
+            data_file: None,
         };
         test_fn(task);
     }

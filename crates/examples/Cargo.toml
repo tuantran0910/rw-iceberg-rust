@@ -25,10 +25,21 @@ rust-version = { workspace = true }
 version = { workspace = true }
 
 [dependencies]
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
 futures = { workspace = true }
+gcloud-auth = { version = "1.0.2" }
 iceberg = { workspace = true, features = ["storage-gcs"] }
 iceberg-catalog-rest = { workspace = true }
+parquet = { workspace = true }
+rand = { workspace = true }
+token-source = "1.0"
 tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 [[example]]
 name = "rest-catalog-namespace"
@@ -41,6 +52,10 @@ path = "src/rest_catalog_biglake.rs"
 [[example]]
 name = "rest-catalog-table"
 path = "src/rest_catalog_table.rs"
+
+[[example]]
+name = "upsert-biglake"
+path = "src/upsert_biglake.rs"
 
 [[example]]
 name = "oss-backend"

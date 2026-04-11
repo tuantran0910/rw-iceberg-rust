@@ -94,9 +94,11 @@ pub mod actions;
 pub mod arrow;
 pub(crate) mod delete_file_index;
 pub mod test_utils;
-mod utils;
+/// Utilities for iceberg operations.
+pub mod utils;
 pub mod writer;
 
 mod delete_vector;
 pub mod metadata_columns;
 pub mod puffin;
+pub mod upsert;
