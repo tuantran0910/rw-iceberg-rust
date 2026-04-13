@@ -29,7 +29,7 @@ use crate::io::FileIO;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter,
-    ManifestWriterBuilder, Operation, PrimitiveLiteral, Snapshot, SnapshotReference,
+    ManifestWriterBuilder, Operation, PartitionSpec, PrimitiveLiteral, Snapshot, SnapshotReference,
     SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties,
     UNASSIGNED_SEQUENCE_NUMBER, update_snapshot_summaries,
 };
@@ -312,6 +312,43 @@ impl<'a> SnapshotProducer<'a> {
         }
     }
 
+    /// Like [`Self::new_manifest_writer`] but accepts a [`PartitionSpec`] directly instead of
+    /// a spec id. Use this when the desired spec may not be registered in the table metadata
+    /// (e.g. the synthetic empty spec used for global equality delete manifests).
+    fn new_manifest_writer_with_spec(
+        &mut self,
+        content: ManifestContentType,
+        partition_spec: PartitionSpec,
+    ) -> Result<ManifestWriter> {
+        let new_manifest_path = format!(
+            "{}/{}/{}-m{}.{}",
+            self.table.metadata().location(),
+            META_ROOT_PATH,
+            self.commit_uuid,
+            self.manifest_counter.fetch_add(1, Ordering::SeqCst),
+            DataFileFormat::Avro
+        );
+        let output_file = self.table.file_io().new_output(new_manifest_path)?;
+        let builder = ManifestWriterBuilder::new(
+            output_file,
+            Some(self.snapshot_id),
+            self.key_metadata.clone(),
+            self.table.metadata().current_schema().clone(),
+            partition_spec,
+        );
+        match self.table.metadata().format_version() {
+            FormatVersion::V1 => Ok(builder.build_v1()),
+            FormatVersion::V2 => match content {
+                ManifestContentType::Data => Ok(builder.build_v2_data()),
+                ManifestContentType::Deletes => Ok(builder.build_v2_deletes()),
+            },
+            FormatVersion::V3 => match content {
+                ManifestContentType::Data => Ok(builder.build_v3_data()),
+                ManifestContentType::Deletes => Ok(builder.build_v3_deletes()),
+            },
+        }
+    }
+
     // Check if the partition value is compatible with the partition type.
     fn validate_partition_value(
         partition_value: &Struct,
@@ -418,6 +455,19 @@ partition_struct: {:?}, partition_type: {:?}",
             }
         };
 
+        // For equality delete files that were written with an unpartitioned (empty) partition
+        // spec, we must use an explicitly 0-field partition spec when writing the manifest.
+        // Otherwise the Avro schema derived from the table's partitioned spec would add null
+        // fields for the missing partition columns, and when the manifest is read back the
+        // partition struct would appear non-empty, preventing the delete from being classified
+        // as a global equality delete in `PopulatedDeleteFileIndex`.
+        let is_global_equality_delete_manifest = manifest_content_type
+            == ManifestContentType::Deletes
+            && added_files.iter().all(|f| {
+                f.content_type() == DataContentType::EqualityDeletes
+                    && f.partition().fields().is_empty()
+            });
+
         let snapshot_id = self.snapshot_id;
         let format_version = self.table.metadata().format_version();
         let manifest_entries = added_files.into_iter().map(|data_file| {
@@ -435,10 +485,20 @@ partition_struct: {:?}, partition_type: {:?}",
             }
         });
 
-        let mut writer = self.new_manifest_writer(
-            manifest_content_type,
-            self.table.metadata().default_partition_spec_id(),
-        )?;
+        let mut writer = if is_global_equality_delete_manifest {
+            // Use the unpartitioned spec (0 fields) so the manifest's Avro schema has no
+            // partition columns and the empty-partition struct is preserved faithfully on
+            // round-trip, allowing the delete file index to correctly classify these as global.
+            self.new_manifest_writer_with_spec(
+                manifest_content_type,
+                PartitionSpec::unpartition_spec(),
+            )?
+        } else {
+            self.new_manifest_writer(
+                manifest_content_type,
+                self.table.metadata().default_partition_spec_id(),
+            )?
+        };
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }

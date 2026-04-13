@@ -25,6 +25,7 @@
 //!  4. After all files, write unmatched source rows (inserts) as new data files.
 //!  5. Commit via `OverwriteFilesAction` (added files + removed old files).
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_array::{BooleanArray, RecordBatch};
@@ -33,11 +34,12 @@ use futures::stream::TryStreamExt;
 use parquet::file::properties::WriterProperties;
 use tracing::{debug, info};
 
-use super::UpsertResult;
 use super::matcher::UpsertMatcher;
 use super::planner::KeyColumn;
+use super::{UpsertFileDelta, UpsertResult};
+use crate::arrow::record_batch_partition_splitter::RecordBatchPartitionSplitter;
 use crate::catalog::Catalog;
-use crate::spec::{DataFile, DataFileFormat};
+use crate::spec::{DataFile, DataFileFormat, PartitionSpec};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::utils::{DEFAULT_UPSERT_DATA_LOAD_CONCURRENCY, load_data_files};
@@ -47,6 +49,8 @@ use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use crate::writer::partitioning::PartitioningWriter;
+use crate::writer::partitioning::fanout_writer::FanoutWriter;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::{Error, ErrorKind, Result};
 
@@ -79,6 +83,9 @@ pub(super) async fn execute(
     let mut rows_updated: u64 = 0;
     let mut files_rewritten: u64 = 0;
 
+    // Get the default partition spec (None if the table is unpartitioned).
+    let partition_spec = table.metadata().default_partition_spec();
+
     // Scan matching files.
     let scan = table.scan().with_filter(predicate.clone()).build()?;
 
@@ -96,10 +103,23 @@ pub(super) async fn execute(
 
     let read_start = Instant::now();
 
-    // Phase 1: Read all matched files concurrently
+    // Phase 1: Read all matched files concurrently.
+    // Strip predicates before reading: the predicate is used only for FILE pruning
+    // (above). For CoW we must read ALL rows in each matched file so that unmatched
+    // target rows (whose keys are outside the source key range) are preserved in
+    // the rewritten file. Row-level filtering here would silently drop those rows.
+    let file_tasks_for_read: Vec<_> = file_tasks
+        .iter()
+        .map(|task| {
+            let mut t = task.clone();
+            t.predicate = None;
+            t
+        })
+        .collect();
+
     let data_file_reads = load_data_files(
         &file_io,
-        file_tasks.clone(),
+        file_tasks_for_read,
         DEFAULT_UPSERT_DATA_LOAD_CONCURRENCY,
     )
     .await?;
@@ -200,7 +220,8 @@ pub(super) async fn execute(
         }
 
         // Rewrite the file with merged content.
-        let new_data_files = write_data_files(&table, rewrite_batches).await?;
+        let new_data_files =
+            write_data_files(&table, rewrite_batches, Some(partition_spec)).await?;
         added_data_files.extend(new_data_files);
 
         // Mark the original file as deleted.
@@ -226,12 +247,25 @@ pub(super) async fn execute(
     let unmatched_mask = matcher.unmatched_source_mask();
     if unmatched_mask.true_count() > 0 {
         let insert_batch = filter_record_batch(matcher.source(), &unmatched_mask)?;
-        let new_inserts = write_data_files(&table, vec![insert_batch]).await?;
+        let new_inserts =
+            write_data_files(&table, vec![insert_batch], Some(partition_spec)).await?;
         added_data_files.extend(new_inserts);
     }
 
     // Compute rows_inserted from the unmatched source count.
     let rows_inserted = unmatched_mask.true_count() as u64;
+
+    // Early return: nothing changed (skip_unchanged=true and all rows were identical).
+    // OverwriteFilesAction rejects a commit with zero added AND zero deleted files.
+    if added_data_files.is_empty() && deleted_data_files.is_empty() {
+        return Ok((table, UpsertResult {
+            rows_updated: 0,
+            rows_inserted: 0,
+            files_affected: 0,
+            files_added: 0,
+            files_removed: 0,
+        }));
+    }
 
     // Commit via OverwriteFilesAction.
     let commit_start = Instant::now();
@@ -269,9 +303,162 @@ pub(super) async fn execute(
     }))
 }
 
+/// Compute the CoW file delta without committing to any catalog.
+///
+/// The caller must pass a fresh, up-to-date `Table`. This function performs
+/// the same scan-match-write work as [`execute`] but skips the catalog reload
+/// and transaction commit, returning the raw file delta instead.
+pub(super) async fn compute(
+    table: &Table,
+    source: RecordBatch,
+    key_columns: &[KeyColumn],
+    non_key_column_indices: &[usize],
+    predicate: &crate::expr::Predicate,
+    skip_unchanged: bool,
+) -> Result<UpsertFileDelta> {
+    let key_indices: Vec<usize> = key_columns.iter().map(|k| k.schema_index).collect();
+    let file_io = table.file_io().clone();
+
+    // Get the default partition spec (None if the table is unpartitioned).
+    let partition_spec = table.metadata().default_partition_spec();
+
+    let mut matcher = UpsertMatcher::new(&source, &key_indices, non_key_column_indices)?;
+
+    let mut deleted_data_files: Vec<DataFile> = Vec::new();
+    let mut added_data_files: Vec<DataFile> = Vec::new();
+    let mut rows_updated: u64 = 0;
+    let mut files_rewritten: u64 = 0;
+
+    let scan = table.scan().with_filter(predicate.clone()).build()?;
+    let file_scan_stream = scan.plan_files().await?;
+    let file_tasks: Vec<_> = file_scan_stream.try_collect().await?;
+
+    // Strip predicates before reading: the predicate is used only for FILE pruning.
+    // For CoW we must read ALL rows in each matched file so that unmatched target
+    // rows (whose keys are outside the source key range) are preserved in the
+    // rewritten file. Row-level filtering here would silently drop those rows.
+    let file_tasks_for_read: Vec<_> = file_tasks
+        .iter()
+        .map(|task| {
+            let mut t = task.clone();
+            t.predicate = None;
+            t
+        })
+        .collect();
+
+    let data_file_reads = load_data_files(
+        &file_io,
+        file_tasks_for_read,
+        DEFAULT_UPSERT_DATA_LOAD_CONCURRENCY,
+    )
+    .await?;
+
+    for read_result in &data_file_reads {
+        let mut has_changes = false;
+        let mut rewrite_batches: Vec<RecordBatch> = Vec::new();
+
+        for batch in &read_result.batches {
+            let result = matcher.match_batch(batch)?;
+            let n_matched = result.matched_target_indices.len();
+
+            if n_matched == 0 {
+                rewrite_batches.push(batch.clone());
+                continue;
+            }
+
+            let changed_mask: BooleanArray = if skip_unchanged {
+                result.changed_mask
+            } else {
+                BooleanArray::from(vec![true; n_matched])
+            };
+
+            let has_changed = changed_mask.true_count();
+
+            if has_changed < n_matched {
+                let unchanged_in_target = {
+                    let mut m = vec![false; batch.num_rows()];
+                    for i in 0..n_matched {
+                        if !changed_mask.value(i) {
+                            m[result.matched_target_indices.value(i) as usize] = true;
+                        }
+                    }
+                    BooleanArray::from(m)
+                };
+                let kept = filter_record_batch(batch, &unchanged_in_target)?;
+                rewrite_batches.push(kept);
+            }
+
+            if has_changed > 0 {
+                has_changes = true;
+                let changed_in_source = {
+                    let mut m = vec![false; matcher.source_len()];
+                    for i in 0..n_matched {
+                        if changed_mask.value(i) {
+                            m[result.matched_source_indices.value(i) as usize] = true;
+                        }
+                    }
+                    BooleanArray::from(m)
+                };
+                let updated = filter_record_batch(matcher.source(), &changed_in_source)?;
+                rewrite_batches.push(updated);
+                rows_updated += has_changed as u64;
+            }
+
+            if result.unmatched_target_mask.true_count() > 0 {
+                let unmatched = filter_record_batch(batch, &result.unmatched_target_mask)?;
+                rewrite_batches.push(unmatched);
+            }
+        }
+
+        if !has_changes {
+            continue;
+        }
+
+        let new_data_files = write_data_files(table, rewrite_batches, Some(partition_spec)).await?;
+        added_data_files.extend(new_data_files);
+
+        if let Some(data_file) = &read_result.task.data_file {
+            deleted_data_files.push(data_file.clone());
+        }
+        files_rewritten += 1;
+    }
+
+    // Write unmatched source rows (inserts).
+    let unmatched_mask = matcher.unmatched_source_mask();
+    if unmatched_mask.true_count() > 0 {
+        let insert_batch = filter_record_batch(matcher.source(), &unmatched_mask)?;
+        let new_inserts = write_data_files(table, vec![insert_batch], Some(partition_spec)).await?;
+        added_data_files.extend(new_inserts);
+    }
+
+    let rows_inserted = unmatched_mask.true_count() as u64;
+    let files_added = added_data_files.len() as u64;
+    let files_removed = deleted_data_files.len() as u64;
+
+    Ok(UpsertFileDelta {
+        added_data_files,
+        deleted_data_files,
+        stats: UpsertResult {
+            rows_updated,
+            rows_inserted,
+            files_affected: files_rewritten,
+            files_added,
+            files_removed,
+        },
+    })
+}
+
 /// Write a sequence of RecordBatches as new Iceberg data files, returning
 /// the resulting `Vec<DataFile>`.
-async fn write_data_files(table: &Table, batches: Vec<RecordBatch>) -> Result<Vec<DataFile>> {
+///
+/// When `partition_spec` is `Some` and the table is partitioned, uses
+/// `FanoutWriter` + `RecordBatchPartitionSplitter` to compute partition values
+/// from source columns and write each partition group to its own data file.
+async fn write_data_files(
+    table: &Table,
+    batches: Vec<RecordBatch>,
+    partition_spec: Option<&PartitionSpec>,
+) -> Result<Vec<DataFile>> {
     if batches.is_empty() {
         return Ok(Vec::new());
     }
@@ -302,13 +489,35 @@ async fn write_data_files(table: &Table, batches: Vec<RecordBatch>) -> Result<Ve
         file_name_generator,
     );
 
-    let writer: DataFileWriterBuilder<
-        ParquetWriterBuilder,
-        DefaultLocationGenerator,
-        DefaultFileNameGenerator,
-    > = DataFileWriterBuilder::new(rolling_writer_builder);
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
-    let mut writer = writer.build(None).await.map_err(|e| {
+    // Use FanoutWriter when a partition spec is present and the table is partitioned.
+    // The RecordBatchPartitionSplitter computes partition values from source columns
+    // using the partition spec's transforms (identity, year, month, bucket[N], etc.).
+    if let Some(spec) = partition_spec
+        && !spec.is_unpartitioned()
+    {
+        let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+            schema,
+            Arc::new(spec.clone()),
+        )?;
+
+        let mut fanout_writer = FanoutWriter::new(data_file_writer_builder);
+
+        for batch in batches {
+            let partitioned = splitter.split(&batch)?;
+            for (partition_key, partitioned_batch) in partitioned {
+                fanout_writer
+                    .write(partition_key, partitioned_batch)
+                    .await?;
+            }
+        }
+
+        return fanout_writer.close().await;
+    }
+
+    // Unpartitioned case: use a single DataFileWriter with no partition key.
+    let mut writer = data_file_writer_builder.build(None).await.map_err(|e| {
         Error::new(
             ErrorKind::Unexpected,
             format!("Failed to build data file writer: {e}"),
@@ -321,12 +530,5 @@ async fn write_data_files(table: &Table, batches: Vec<RecordBatch>) -> Result<Ve
         })?;
     }
 
-    let data_files = writer.close().await.map_err(|e| {
-        Error::new(
-            ErrorKind::Unexpected,
-            format!("Failed to close data file writer: {e}"),
-        )
-    })?;
-
-    Ok(data_files)
+    writer.close().await
 }

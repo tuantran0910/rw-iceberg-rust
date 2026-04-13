@@ -23,11 +23,13 @@ mod error;
 mod manifest;
 mod runtime;
 mod transform;
+mod upsert;
 
 #[pymodule]
 fn pyiceberg_core_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     datafusion_table_provider::register_module(py, m)?;
     transform::register_module(py, m)?;
     manifest::register_module(py, m)?;
+    upsert::register_module(py, m)?;
     Ok(())
 }

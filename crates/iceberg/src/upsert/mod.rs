@@ -28,6 +28,7 @@ use arrow_array::RecordBatch;
 use crate::Result;
 use crate::catalog::Catalog;
 use crate::expr::Predicate;
+use crate::spec::DataFile;
 use crate::table::Table;
 
 /// Write strategy for upsert operations.
@@ -110,6 +111,23 @@ pub struct UpsertResult {
     pub files_removed: u64,
 }
 
+/// File delta produced by [`upsert_compute`]: files written to storage + files to delete,
+/// without a catalog commit.
+///
+/// The caller is responsible for committing this delta to the catalog using any
+/// transaction mechanism (e.g., `OverwriteFilesAction` in Rust, or the PyIceberg
+/// transaction API in Python).
+#[derive(Debug)]
+pub struct UpsertFileDelta {
+    /// New data files written to storage (rewrites + inserts for CoW; new data files
+    /// + equality-delete files for MoR).
+    pub added_data_files: Vec<DataFile>,
+    /// Original data files to mark as deleted in the catalog (CoW only; empty for MoR).
+    pub deleted_data_files: Vec<DataFile>,
+    /// Operation statistics.
+    pub stats: UpsertResult,
+}
+
 /// Execute an upsert operation on `table` using `source` as the upsert data.
 ///
 /// The operation uses the Arrow-based [`matcher::UpsertMatcher`] for vectorized
@@ -148,6 +166,10 @@ pub async fn upsert(
     planner::validate_source_keys(&source, &key_indices)?;
 
     // 3. Build (or use provided) bounding-box pruning predicate
+    // Always use build_pruning_predicate for full source range to correctly handle
+    // mixed update/insert workloads. The insert-optimized predicate approach was
+    // incorrect because it couldn't distinguish updates from inserts without
+    // pre-scanning the existing table.
     let predicate = match config.pruning_predicate {
         Some(p) => p,
         None => planner::build_pruning_predicate(&source, &key_columns)?.ok_or_else(|| {
@@ -186,5 +208,597 @@ pub async fn upsert(
             )
             .await
         }
+    }
+}
+
+/// Compute the upsert file delta without committing to any catalog.
+///
+/// Unlike [`upsert`], this function does **not** interact with a catalog at all.
+/// The caller must:
+///   1. Pass a **fresh** `Table` loaded from the catalog immediately before calling
+///      this function (so the scan sees all committed files).
+///   2. Commit the returned [`UpsertFileDelta`] to the catalog using any transaction
+///      mechanism appropriate for the caller's environment.
+///
+/// This is the building block for catalog-agnostic language bindings such as the
+/// PyIceberg integration, where Python handles the catalog commit.
+pub async fn upsert_compute(
+    table: &Table,
+    source: RecordBatch,
+    config: UpsertConfig,
+) -> Result<UpsertFileDelta> {
+    let schema = table.metadata().current_schema();
+    let key_columns = planner::resolve_key_columns(schema, &config.join_columns)?;
+    let key_indices: Vec<usize> = key_columns.iter().map(|k| k.schema_index).collect();
+    planner::validate_source_keys(&source, &key_indices)?;
+
+    let predicate = match config.pruning_predicate {
+        Some(p) => p,
+        None => planner::build_pruning_predicate(&source, &key_columns)?.ok_or_else(|| {
+            crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                "Source batch is empty; nothing to upsert",
+            )
+        })?,
+    };
+
+    let non_key_indices = planner::non_key_column_indices(schema, &key_columns)?;
+
+    match config.write_mode {
+        UpsertWriteMode::CopyOnWrite => {
+            cow_executor::compute(
+                table,
+                source,
+                &key_columns,
+                &non_key_indices,
+                &predicate,
+                config.skip_unchanged,
+            )
+            .await
+        }
+        UpsertWriteMode::MergeOnRead => {
+            mor_executor::compute(table, source, &key_columns, &non_key_indices, &predicate).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use futures::TryStreamExt;
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use parquet::file::properties::WriterProperties;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::catalog::memory::MEMORY_CATALOG_WAREHOUSE;
+    use crate::catalog::{CatalogBuilder, MemoryCatalog};
+    use crate::memory::MemoryCatalogBuilder;
+    use crate::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+    use crate::transaction::{ApplyTransactionAction, Transaction};
+    use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use crate::writer::file_writer::ParquetWriterBuilder;
+    use crate::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, DefaultLocationGenerator,
+    };
+    use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+    use crate::writer::{IcebergWriter, IcebergWriterBuilder};
+    use crate::{Catalog, NamespaceIdent, TableCreation};
+
+    // ── Schema helpers ────────────────────────────────────────────────────────
+
+    /// Iceberg schema: id (Long, required, identifier), name (String, required),
+    /// value (String, optional).
+    fn test_iceberg_schema() -> Schema {
+        Schema::builder()
+            .with_schema_id(1)
+            .with_identifier_field_ids(vec![1])
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    /// Arrow schema matching the Iceberg schema above, with Iceberg field IDs
+    /// embedded in metadata so the parquet writer stores them in the file footer.
+    fn test_arrow_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+            Field::new("value", DataType::Utf8, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "3".to_string(),
+            )])),
+        ]))
+    }
+
+    fn make_batch(ids: Vec<i64>, names: Vec<&str>, values: Vec<Option<&str>>) -> RecordBatch {
+        RecordBatch::try_new(test_arrow_schema(), vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(values)),
+        ])
+        .unwrap()
+    }
+
+    // ── Catalog / table setup helpers ─────────────────────────────────────────
+
+    /// Creates a MemoryCatalog backed by a real temp directory and returns the
+    /// `TempDir` handle so the caller keeps it alive for the test duration.
+    async fn setup_catalog() -> (MemoryCatalog, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse = temp_dir.path().to_str().unwrap().to_string();
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+            )
+            .await
+            .unwrap();
+        (catalog, temp_dir)
+    }
+
+    /// Creates a namespace + table inside `catalog` using `test_iceberg_schema()`.
+    async fn setup_table(catalog: &impl Catalog) -> Table {
+        let ns = NamespaceIdent::from_strs(["test_ns"]).unwrap();
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+
+        catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("upsert_test".to_string())
+                    .schema(test_iceberg_schema())
+                    .build(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Writes `batch` as a real Parquet data file, commits it to `table` via
+    /// `fast_append`, and returns the refreshed `Table`.
+    async fn commit_batch(table: &Table, catalog: &dyn Catalog, batch: RecordBatch) -> Table {
+        let file_io = table.file_io().clone();
+        let metadata = table.metadata();
+
+        let location_gen = DefaultLocationGenerator::new(metadata.clone()).unwrap();
+        let file_name_gen = DefaultFileNameGenerator::new(
+            "test-initial".to_string(),
+            Some(uuid::Uuid::now_v7().to_string()),
+            DataFileFormat::Parquet,
+        );
+        let parquet_builder = ParquetWriterBuilder::new(
+            WriterProperties::default(),
+            metadata.current_schema().clone(),
+        );
+        let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_builder,
+            file_io,
+            location_gen,
+            file_name_gen,
+        );
+        let mut writer = DataFileWriterBuilder::new(rolling_builder)
+            .build(None)
+            .await
+            .unwrap();
+        writer.write(batch).await.unwrap();
+        let data_files = writer.close().await.unwrap();
+
+        let tx = Transaction::new(table);
+        let action = tx.fast_append().add_data_files(data_files);
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog).await.unwrap()
+    }
+
+    /// Scans all rows from `table` and returns them as `RecordBatch`es.
+    async fn scan_all(table: &Table) -> Vec<RecordBatch> {
+        table
+            .scan()
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+    }
+
+    fn total_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    /// Extracts all `id` values from scanned batches, sorted ascending.
+    fn sorted_ids(batches: &[RecordBatch]) -> Vec<i64> {
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Returns the `name` value for the row with the given `id`, if found.
+    fn find_name(batches: &[RecordBatch], id: i64) -> Option<String> {
+        for batch in batches {
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let name_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                if id_col.value(row) == id {
+                    return Some(name_col.value(row).to_string());
+                }
+            }
+        }
+        None
+    }
+
+    // ── CoW tests ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_cow_empty_table_all_inserts() {
+        let (catalog, _tmp) = setup_catalog().await;
+        let table = setup_table(&catalog).await;
+
+        let source = make_batch(vec![1, 2, 3], vec!["alice", "bob", "charlie"], vec![
+            Some("v1"),
+            Some("v2"),
+            Some("v3"),
+        ]);
+        let config = UpsertConfig {
+            write_mode: UpsertWriteMode::CopyOnWrite,
+            ..Default::default()
+        };
+
+        let (table, result) = upsert(&table, &catalog, source, config).await.unwrap();
+
+        assert_eq!(result.rows_inserted, 3);
+        assert_eq!(result.rows_updated, 0);
+        assert_eq!(result.files_removed, 0);
+
+        let batches = scan_all(&table).await;
+        assert_eq!(total_rows(&batches), 3);
+        assert_eq!(sorted_ids(&batches), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_cow_no_key_overlap_inserts_into_existing_table() {
+        let (catalog, _tmp) = setup_catalog().await;
+        let table = setup_table(&catalog).await;
+
+        // Write initial data: ids 1, 2, 3.
+        let initial = make_batch(vec![1, 2, 3], vec!["alice", "bob", "charlie"], vec![
+            Some("v1"),
+            Some("v2"),
+            Some("v3"),
+        ]);
+        let table = commit_batch(&table, &catalog, initial).await;
+
+        // Upsert with completely new ids: 4, 5.
+        let source = make_batch(vec![4, 5], vec!["diana", "eve"], vec![
+            Some("v4"),
+            Some("v5"),
+        ]);
+        let config = UpsertConfig {
+            write_mode: UpsertWriteMode::CopyOnWrite,
+            ..Default::default()
+        };
+
+        let (table, result) = upsert(&table, &catalog, source, config).await.unwrap();
+
+        assert_eq!(result.rows_inserted, 2);
+        assert_eq!(result.rows_updated, 0);
+        // The existing file with ids [1,2,3] should NOT be rewritten — no key overlap.
+        assert_eq!(
+            result.files_affected, 0,
+            "existing file must not be rewritten for a pure insert"
+        );
+
+        let batches = scan_all(&table).await;
+        assert_eq!(total_rows(&batches), 5);
+        assert_eq!(sorted_ids(&batches), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_cow_full_overlap_all_updates() {
+        let (catalog, _tmp) = setup_catalog().await;
+        let table = setup_table(&catalog).await;
+
+        // Initial data.
+        let initial = make_batch(vec![1, 2], vec!["old_alice", "old_bob"], vec![
+            Some("old_v1"),
+            Some("old_v2"),
+        ]);
+        let table = commit_batch(&table, &catalog, initial).await;
+
+        // Upsert with same ids but different values.
+        let source = make_batch(vec![1, 2], vec!["new_alice", "new_bob"], vec![
+            Some("new_v1"),
+            Some("new_v2"),
+        ]);
+        let config = UpsertConfig {
+            write_mode: UpsertWriteMode::CopyOnWrite,
+            skip_unchanged: true,
+            ..Default::default()
+        };
+
+        let (table, result) = upsert(&table, &catalog, source, config).await.unwrap();
+
+        assert_eq!(result.rows_updated, 2);
+        assert_eq!(result.rows_inserted, 0);
+        assert!(
+            result.files_affected > 0,
+            "existing file should have been rewritten"
+        );
+
+        let batches = scan_all(&table).await;
+        assert_eq!(total_rows(&batches), 2);
+        assert_eq!(find_name(&batches, 1).as_deref(), Some("new_alice"));
+        assert_eq!(find_name(&batches, 2).as_deref(), Some("new_bob"));
+    }
+
+    #[tokio::test]
+    async fn test_cow_skip_unchanged_does_not_rewrite() {
+        let (catalog, _tmp) = setup_catalog().await;
+        let table = setup_table(&catalog).await;
+
+        // Initial data.
+        let initial = make_batch(vec![1, 2], vec!["alice", "bob"], vec![
+            Some("v1"),
+            Some("v2"),
+        ]);
+        let table = commit_batch(&table, &catalog, initial).await;
+
+        // Upsert with identical rows (no actual change).
+        let source = make_batch(vec![1, 2], vec!["alice", "bob"], vec![
+            Some("v1"),
+            Some("v2"),
+        ]);
+        let config = UpsertConfig {
+            write_mode: UpsertWriteMode::CopyOnWrite,
+            skip_unchanged: true,
+            ..Default::default()
+        };
+
+        let (table, result) = upsert(&table, &catalog, source, config).await.unwrap();
+
+        assert_eq!(
+            result.files_affected, 0,
+            "no files should be rewritten when rows are unchanged"
+        );
+        assert_eq!(result.rows_updated, 0);
+        assert_eq!(result.rows_inserted, 0);
+
+        // Verify data integrity: the original rows must still be readable after a no-op upsert.
+        // A broken early-return that corrupts catalog state would fail here.
+        let batches = scan_all(&table).await;
+        assert_eq!(total_rows(&batches), 2, "original rows must be preserved");
+        assert_eq!(find_name(&batches, 1).as_deref(), Some("alice"));
+        assert_eq!(find_name(&batches, 2).as_deref(), Some("bob"));
+    }
+
+    #[tokio::test]
+    async fn test_cow_mixed_updates_and_inserts() {
+        let (catalog, _tmp) = setup_catalog().await;
+        let table = setup_table(&catalog).await;
+
+        // Initial data: ids 1, 2, 3.
+        let initial = make_batch(vec![1, 2, 3], vec!["alice", "bob", "charlie"], vec![
+            Some("v1"),
+            Some("v2"),
+            Some("v3"),
+        ]);
+        let table = commit_batch(&table, &catalog, initial).await;
+
+        // Upsert: ids 2 & 3 update, ids 4 & 5 insert.
+        let source = make_batch(
+            vec![2, 3, 4, 5],
+            vec!["new_bob", "new_charlie", "diana", "eve"],
+            vec![Some("nv2"), Some("nv3"), Some("v4"), Some("v5")],
+        );
+        let config = UpsertConfig {
+            write_mode: UpsertWriteMode::CopyOnWrite,
+            ..Default::default()
+        };
+
+        let (table, result) = upsert(&table, &catalog, source, config).await.unwrap();
+
+        assert_eq!(result.rows_updated, 2);
+        assert_eq!(result.rows_inserted, 2);
+
+        let batches = scan_all(&table).await;
+        assert_eq!(total_rows(&batches), 5);
+        assert_eq!(sorted_ids(&batches), vec![1, 2, 3, 4, 5]);
+        // id=1 unchanged.
+        assert_eq!(find_name(&batches, 1).as_deref(), Some("alice"));
+        // id=2 updated.
+        assert_eq!(find_name(&batches, 2).as_deref(), Some("new_bob"));
+    }
+
+    // ── MoR tests ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_mor_all_inserts_no_delete_file_created() {
+        let (catalog, _tmp) = setup_catalog().await;
+        let table = setup_table(&catalog).await;
+
+        // Initial data.
+        let initial = make_batch(vec![1, 2, 3], vec!["alice", "bob", "charlie"], vec![
+            Some("v1"),
+            Some("v2"),
+            Some("v3"),
+        ]);
+        let table = commit_batch(&table, &catalog, initial).await;
+
+        // Upsert with completely new ids → no matches, so no equality-delete file.
+        let source = make_batch(vec![4, 5], vec!["diana", "eve"], vec![
+            Some("v4"),
+            Some("v5"),
+        ]);
+        let config = UpsertConfig {
+            write_mode: UpsertWriteMode::MergeOnRead,
+            ..Default::default()
+        };
+
+        let (table, result) = upsert(&table, &catalog, source, config).await.unwrap();
+
+        assert_eq!(result.rows_inserted, 2);
+        assert_eq!(result.rows_updated, 0);
+        // No equality-delete file should be created when there are no matches.
+        assert_eq!(result.files_affected, 0);
+
+        let batches = scan_all(&table).await;
+        assert_eq!(total_rows(&batches), 5);
+        assert_eq!(sorted_ids(&batches), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_mor_all_updates_creates_equality_delete_file() {
+        let (catalog, _tmp) = setup_catalog().await;
+        let table = setup_table(&catalog).await;
+
+        // Initial data.
+        let initial = make_batch(vec![1, 2], vec!["old_alice", "old_bob"], vec![
+            Some("old_v1"),
+            Some("old_v2"),
+        ]);
+        let table = commit_batch(&table, &catalog, initial).await;
+
+        // Upsert all rows with changed values → equality-delete file expected.
+        let source = make_batch(vec![1, 2], vec!["new_alice", "new_bob"], vec![
+            Some("new_v1"),
+            Some("new_v2"),
+        ]);
+        let config = UpsertConfig {
+            write_mode: UpsertWriteMode::MergeOnRead,
+            ..Default::default()
+        };
+
+        let (table, result) = upsert(&table, &catalog, source, config).await.unwrap();
+
+        assert_eq!(result.rows_updated, 2);
+        assert_eq!(result.rows_inserted, 0);
+        assert!(
+            result.files_affected >= 1,
+            "an equality-delete file should have been created"
+        );
+
+        // Scan must apply equality deletes → final count stays 2, not 4.
+        let batches = scan_all(&table).await;
+        assert_eq!(
+            total_rows(&batches),
+            2,
+            "equality deletes must be applied during scan"
+        );
+        assert_eq!(find_name(&batches, 1).as_deref(), Some("new_alice"));
+        assert_eq!(find_name(&batches, 2).as_deref(), Some("new_bob"));
+    }
+
+    #[tokio::test]
+    async fn test_mor_mixed_updates_and_inserts() {
+        let (catalog, _tmp) = setup_catalog().await;
+        let table = setup_table(&catalog).await;
+
+        // Initial data: ids 1, 2, 3.
+        let initial = make_batch(vec![1, 2, 3], vec!["alice", "bob", "charlie"], vec![
+            Some("v1"),
+            Some("v2"),
+            Some("v3"),
+        ]);
+        let table = commit_batch(&table, &catalog, initial).await;
+
+        // Upsert: ids 2 & 3 update, ids 4 & 5 insert.
+        let source = make_batch(
+            vec![2, 3, 4, 5],
+            vec!["new_bob", "new_charlie", "diana", "eve"],
+            vec![Some("nv2"), Some("nv3"), Some("v4"), Some("v5")],
+        );
+        let config = UpsertConfig {
+            write_mode: UpsertWriteMode::MergeOnRead,
+            ..Default::default()
+        };
+
+        let (table, result) = upsert(&table, &catalog, source, config).await.unwrap();
+
+        assert_eq!(result.rows_updated, 2);
+        assert_eq!(result.rows_inserted, 2);
+
+        // Equality deletes for ids 2 & 3 plus the new data file → 5 final rows.
+        let batches = scan_all(&table).await;
+        assert_eq!(total_rows(&batches), 5);
+        assert_eq!(sorted_ids(&batches), vec![1, 2, 3, 4, 5]);
+        // id=1 untouched.
+        assert_eq!(find_name(&batches, 1).as_deref(), Some("alice"));
+        // id=2 should reflect the updated value.
+        assert_eq!(find_name(&batches, 2).as_deref(), Some("new_bob"));
+    }
+
+    #[tokio::test]
+    async fn test_mor_two_rounds_accumulate_correctly() {
+        let (catalog, _tmp) = setup_catalog().await;
+        let table = setup_table(&catalog).await;
+
+        // Round 0: write 3 initial rows.
+        let initial = make_batch(vec![1, 2, 3], vec!["a1", "a2", "a3"], vec![
+            Some("v1"),
+            Some("v2"),
+            Some("v3"),
+        ]);
+        let table = commit_batch(&table, &catalog, initial).await;
+
+        // Round 1: update id=1, insert id=4.
+        let source1 = make_batch(vec![1, 4], vec!["b1", "a4"], vec![Some("nv1"), Some("v4")]);
+        let config = UpsertConfig {
+            write_mode: UpsertWriteMode::MergeOnRead,
+            ..Default::default()
+        };
+        let (table, r1) = upsert(&table, &catalog, source1, config.clone())
+            .await
+            .unwrap();
+        assert_eq!(r1.rows_updated, 1);
+        assert_eq!(r1.rows_inserted, 1);
+
+        // Round 2: update id=2 (which is in the original data file, not Round 1's new file),
+        // and insert id=5.
+        let source2 = make_batch(vec![2, 5], vec!["b2", "a5"], vec![Some("nv2"), Some("v5")]);
+        let (table, r2) = upsert(&table, &catalog, source2, config).await.unwrap();
+        assert_eq!(r2.rows_updated, 1);
+        assert_eq!(r2.rows_inserted, 1);
+
+        // Final state: ids 1 (updated), 2 (updated), 3 (original), 4 (inserted r1),
+        // 5 (inserted r2) → 5 rows.
+        let batches = scan_all(&table).await;
+        assert_eq!(total_rows(&batches), 5);
+        assert_eq!(sorted_ids(&batches), vec![1, 2, 3, 4, 5]);
+        assert_eq!(find_name(&batches, 1).as_deref(), Some("b1"));
+        assert_eq!(find_name(&batches, 2).as_deref(), Some("b2"));
+        assert_eq!(find_name(&batches, 3).as_deref(), Some("a3")); // untouched
     }
 }

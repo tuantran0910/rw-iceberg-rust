@@ -27,7 +27,7 @@
 //!  5. Write a new data file containing ALL source rows (updates + inserts).
 //!  6. Commit via `OverwriteFilesAction` (both data and delete files).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,12 +37,13 @@ use futures::stream::TryStreamExt;
 use parquet::file::properties::WriterProperties;
 use tracing::{debug, info};
 
-use super::UpsertResult;
 use super::matcher::UpsertMatcher;
 use super::planner::KeyColumn;
+use super::{UpsertFileDelta, UpsertResult};
 use crate::arrow::arrow_schema_to_schema;
+use crate::arrow::record_batch_partition_splitter::RecordBatchPartitionSplitter;
 use crate::catalog::Catalog;
-use crate::spec::{DataFile, DataFileFormat};
+use crate::spec::{DataFile, DataFileFormat, PartitionKey, PartitionSpec, Struct};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::utils::{DEFAULT_UPSERT_DATA_LOAD_CONCURRENCY, load_data_files};
@@ -55,6 +56,8 @@ use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use crate::writer::partitioning::PartitioningWriter;
+use crate::writer::partitioning::fanout_writer::FanoutWriter;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::{Error, ErrorKind, Result};
 
@@ -75,11 +78,17 @@ pub(super) async fn execute(
     // Reload table from catalog so the scan sees all committed data files
     let table = catalog.load_table(table.identifier()).await?;
 
+    // Get the default partition spec (None if the table is unpartitioned).
+    let partition_spec = table.metadata().default_partition_spec();
+
     // Build matcher from source.
     let mut matcher = UpsertMatcher::new(&source, &key_indices, non_key_column_indices)?;
 
-    // Track all matched source key values (for the equality delete file).
-    let mut all_matched_source_indices: Vec<u32> = Vec::new();
+    // Track matched source indices keyed by the TARGET data file's partition.
+    // Using the target partition (not the source row's partition) is critical for
+    // correctness when the upsert changes the partition column value: the equality
+    // delete must be placed in the OLD partition where the row to be removed lives.
+    let mut matched_by_target_partition: HashMap<Struct, Vec<u32>> = HashMap::new();
 
     // Scan matching files.
     let scan = table.scan().with_filter(predicate.clone()).build()?;
@@ -112,6 +121,13 @@ pub(super) async fn execute(
     let mut total_bytes_read: u64 = 0;
 
     for read_result in &data_file_reads {
+        let target_partition = read_result
+            .task
+            .data_file
+            .as_ref()
+            .map(|df| df.partition().clone())
+            .unwrap_or_else(Struct::empty);
+
         if let Some(file_size) = read_result.file_size {
             total_bytes_read += file_size;
             debug!(
@@ -130,15 +146,27 @@ pub(super) async fn execute(
             .map(|b| b.num_rows() as u64)
             .sum::<u64>();
 
+        let partition_matches = matched_by_target_partition
+            .entry(target_partition)
+            .or_default();
         for batch in &read_result.batches {
             let result = matcher.match_batch(batch)?;
-            // Append matched source indices.
             for i in 0..result.matched_source_indices.len() {
-                all_matched_source_indices.push(result.matched_source_indices.value(i));
+                partition_matches.push(result.matched_source_indices.value(i));
             }
         }
     }
     let read_duration = read_start.elapsed();
+
+    // Count globally unique matched source indices for stats.
+    let rows_updated = {
+        let unique: HashSet<u32> = matched_by_target_partition
+            .values()
+            .flat_map(|v| v.iter().copied())
+            .collect();
+        unique.len() as u64
+    };
+    let rows_inserted = matcher.source_len() as u64 - rows_updated;
 
     info!(
         files_read,
@@ -150,34 +178,38 @@ pub(super) async fn execute(
         "MoR: completed file reading phase"
     );
 
-    // Deduplicate matched source indices (a source row may be matched by multiple
-    // target files if there are duplicate key values in the target — which shouldn't
-    // happen for a properly maintained Iceberg table, but we defensively deduplicate).
-    let unique_matched_indices: Vec<u32> = {
-        let mut seen: HashSet<u32> = HashSet::with_capacity(all_matched_source_indices.len());
-        all_matched_source_indices
-            .into_iter()
-            .filter(|&i| seen.insert(i))
-            .collect()
-    };
-
-    let rows_updated = unique_matched_indices.len() as u64;
-    let rows_inserted = matcher.source_len() as u64 - rows_updated;
-
-    // Build equality-delete batch from the key columns of matched source rows.
-    let eq_delete_batch =
-        build_equality_delete_batch(&source, key_columns, &unique_matched_indices)?;
-
-    // Write equality-delete file (if there are matched rows).
+    // Write equality-delete files, one per target partition (or a single global file
+    // for unpartitioned tables). A source row may match in multiple target files within
+    // the same partition; we deduplicate per partition before writing.
     let mut added_delete_files: Vec<DataFile> = Vec::new();
     let write_start = Instant::now();
-    if !unique_matched_indices.is_empty() {
-        let eq_files = write_equality_delete_file(&table, eq_delete_batch, key_columns).await?;
+    for (target_partition, indices) in matched_by_target_partition {
+        if indices.is_empty() {
+            continue;
+        }
+        // Per-partition deduplication.
+        let unique_indices: Vec<u32> = {
+            let mut seen = HashSet::with_capacity(indices.len());
+            indices.into_iter().filter(|&i| seen.insert(i)).collect()
+        };
+        let eq_delete_batch = build_equality_delete_batch(&source, key_columns, &unique_indices)?;
+        let partition_key = if partition_spec.is_unpartitioned() {
+            None
+        } else {
+            Some(PartitionKey::new(
+                partition_spec.as_ref().clone(),
+                table.metadata().current_schema().clone(),
+                target_partition,
+            ))
+        };
+        let eq_files =
+            write_equality_delete_file(&table, eq_delete_batch, key_columns, partition_key).await?;
         added_delete_files.extend(eq_files);
     }
 
     // Write new data file: ALL source rows (matched updates + inserts).
-    let added_data_files = write_data_file(&table, source.clone()).await?;
+    // These ARE partitioned using the table's partition spec.
+    let added_data_files = write_data_file(&table, source.clone(), Some(partition_spec)).await?;
     let data_files_len = added_data_files.len();
     let data_file_size = added_data_files
         .iter()
@@ -191,14 +223,6 @@ pub(super) async fn execute(
     // Compute next sequence number from the already-reloaded table metadata.
     let current_last_seq = table.metadata().last_sequence_number();
     let next_seq = current_last_seq + 1;
-
-    info!(
-        "DEBUG: current_last_sequence_number={}, next_seq={}, eq_delete_count={}, data_file_count={}",
-        current_last_seq,
-        next_seq,
-        added_delete_files.len(),
-        added_data_files.len()
-    );
 
     let overwrite_action = tx
         .overwrite_files()
@@ -233,6 +257,110 @@ pub(super) async fn execute(
         files_added: (added_delete_files.len() + 1) as u64,
         files_removed: 0,
     }))
+}
+
+/// Compute the MoR file delta without committing to any catalog.
+///
+/// The caller must pass a fresh, up-to-date `Table`. This function performs
+/// the same scan-match-write work as [`execute`] but skips the catalog reload
+/// and transaction commit, returning the raw file delta instead.
+pub(super) async fn compute(
+    table: &Table,
+    source: RecordBatch,
+    key_columns: &[KeyColumn],
+    non_key_column_indices: &[usize],
+    predicate: &crate::expr::Predicate,
+) -> Result<UpsertFileDelta> {
+    let key_indices: Vec<usize> = key_columns.iter().map(|k| k.schema_index).collect();
+    let file_io = table.file_io().clone();
+
+    // Get the default partition spec (None if the table is unpartitioned).
+    let partition_spec = table.metadata().default_partition_spec();
+
+    let mut matcher = UpsertMatcher::new(&source, &key_indices, non_key_column_indices)?;
+    let mut matched_by_target_partition: HashMap<Struct, Vec<u32>> = HashMap::new();
+
+    let scan = table.scan().with_filter(predicate.clone()).build()?;
+    let file_scan_stream = scan.plan_files().await?;
+    let file_tasks: Vec<_> = file_scan_stream.try_collect().await?;
+
+    let data_file_reads = load_data_files(
+        &file_io,
+        file_tasks.clone(),
+        DEFAULT_UPSERT_DATA_LOAD_CONCURRENCY,
+    )
+    .await?;
+
+    for read_result in &data_file_reads {
+        let target_partition = read_result
+            .task
+            .data_file
+            .as_ref()
+            .map(|df| df.partition().clone())
+            .unwrap_or_else(Struct::empty);
+        let partition_matches = matched_by_target_partition
+            .entry(target_partition)
+            .or_default();
+        for batch in &read_result.batches {
+            let result = matcher.match_batch(batch)?;
+            for i in 0..result.matched_source_indices.len() {
+                partition_matches.push(result.matched_source_indices.value(i));
+            }
+        }
+    }
+
+    let rows_updated = {
+        let unique: HashSet<u32> = matched_by_target_partition
+            .values()
+            .flat_map(|v| v.iter().copied())
+            .collect();
+        unique.len() as u64
+    };
+    let rows_inserted = matcher.source_len() as u64 - rows_updated;
+
+    let mut added_delete_files: Vec<DataFile> = Vec::new();
+    for (target_partition, indices) in matched_by_target_partition {
+        if indices.is_empty() {
+            continue;
+        }
+        let unique_indices: Vec<u32> = {
+            let mut seen = HashSet::with_capacity(indices.len());
+            indices.into_iter().filter(|&i| seen.insert(i)).collect()
+        };
+        let eq_delete_batch = build_equality_delete_batch(&source, key_columns, &unique_indices)?;
+        let partition_key = if partition_spec.is_unpartitioned() {
+            None
+        } else {
+            Some(PartitionKey::new(
+                partition_spec.as_ref().clone(),
+                table.metadata().current_schema().clone(),
+                target_partition,
+            ))
+        };
+        let eq_files =
+            write_equality_delete_file(table, eq_delete_batch, key_columns, partition_key).await?;
+        added_delete_files.extend(eq_files);
+    }
+
+    // Data files ARE partitioned using the table's partition spec.
+    let added_data_files = write_data_file(table, source.clone(), Some(partition_spec)).await?;
+
+    // Combine: new data files first, then equality-delete files.
+    let mut all_added = added_data_files;
+    all_added.extend(added_delete_files.iter().cloned());
+    let files_added = all_added.len() as u64;
+
+    Ok(UpsertFileDelta {
+        added_data_files: all_added,
+        deleted_data_files: vec![],
+        stats: UpsertResult {
+            rows_updated,
+            rows_inserted,
+            files_affected: added_delete_files.len() as u64,
+            files_added,
+            files_removed: 0,
+        },
+    })
 }
 
 /// Build a RecordBatch containing the key columns for the equality-delete file.
@@ -282,10 +410,15 @@ fn build_equality_delete_batch(
 }
 
 /// Write a single equality-delete file and return its DataFile.
+///
+/// `partition_key` should be `None` for global (unpartitioned) equality deletes and
+/// `Some(pk)` when writing a partition-scoped equality delete file.  The caller is
+/// responsible for splitting the batch by partition before calling this function.
 async fn write_equality_delete_file(
     table: &Table,
     batch: RecordBatch,
     key_columns: &[KeyColumn],
+    partition_key: Option<PartitionKey>,
 ) -> Result<Vec<DataFile>> {
     let file_io = table.file_io().clone();
     let metadata = table.metadata();
@@ -312,7 +445,8 @@ async fn write_equality_delete_file(
         config.projected_arrow_schema_ref().as_ref(),
     )?);
 
-    let parquet_writer_builder = ParquetWriterBuilder::new(WriterProperties::default(), eq_schema);
+    let parquet_writer_builder =
+        ParquetWriterBuilder::new(WriterProperties::default(), eq_schema.clone());
 
     let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_writer_builder,
@@ -323,7 +457,7 @@ async fn write_equality_delete_file(
 
     let eq_writer_builder = EqualityDeleteFileWriterBuilder::new(rolling_writer_builder, config);
 
-    let mut eq_writer = eq_writer_builder.build(None).await.map_err(|e| {
+    let mut eq_writer = eq_writer_builder.build(partition_key).await.map_err(|e| {
         Error::new(
             ErrorKind::Unexpected,
             format!("Failed to build equality delete writer: {e}"),
@@ -337,20 +471,23 @@ async fn write_equality_delete_file(
         )
     })?;
 
-    let files = eq_writer.close().await.map_err(|e| {
+    eq_writer.close().await.map_err(|e| {
         Error::new(
             ErrorKind::Unexpected,
             format!("Failed to close equality delete writer: {e}"),
         )
-    })?;
-
-    Ok(files)
+    })
 }
 
 /// Write a single data file from a RecordBatch.
-async fn write_data_file(table: &Table, batch: RecordBatch) -> Result<Vec<DataFile>> {
+async fn write_data_file(
+    table: &Table,
+    batch: RecordBatch,
+    partition_spec: Option<&PartitionSpec>,
+) -> Result<Vec<DataFile>> {
     let file_io = table.file_io().clone();
     let metadata = table.metadata();
+    let schema = metadata.current_schema().clone();
     let location_generator = DefaultLocationGenerator::new(metadata.clone()).map_err(|e| {
         Error::new(
             ErrorKind::Unexpected,
@@ -364,10 +501,8 @@ async fn write_data_file(table: &Table, batch: RecordBatch) -> Result<Vec<DataFi
         DataFileFormat::Parquet,
     );
 
-    let parquet_writer_builder = ParquetWriterBuilder::new(
-        WriterProperties::default(),
-        metadata.current_schema().clone(),
-    );
+    let parquet_writer_builder =
+        ParquetWriterBuilder::new(WriterProperties::default(), schema.clone());
 
     let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_writer_builder,
@@ -376,13 +511,30 @@ async fn write_data_file(table: &Table, batch: RecordBatch) -> Result<Vec<DataFi
         file_name_generator,
     );
 
-    let writer: DataFileWriterBuilder<
-        ParquetWriterBuilder,
-        DefaultLocationGenerator,
-        DefaultFileNameGenerator,
-    > = DataFileWriterBuilder::new(rolling_writer_builder);
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
-    let mut writer = writer.build(None).await.map_err(|e| {
+    // Use FanoutWriter when partitioned to write to multiple partition files.
+    if let Some(spec) = partition_spec
+        && !spec.is_unpartitioned()
+    {
+        let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+            schema.clone(),
+            Arc::new(spec.clone()),
+        )?;
+
+        let mut fanout_writer = FanoutWriter::new(data_file_writer_builder);
+
+        let partitioned = splitter.split(&batch)?;
+        for (partition_key, partitioned_batch) in partitioned {
+            fanout_writer
+                .write(partition_key, partitioned_batch)
+                .await?;
+        }
+
+        return fanout_writer.close().await;
+    }
+
+    let mut writer = data_file_writer_builder.build(None).await.map_err(|e| {
         Error::new(
             ErrorKind::Unexpected,
             format!("Failed to build data file writer: {e}"),

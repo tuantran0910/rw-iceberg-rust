@@ -19,7 +19,6 @@ use std::cmp::min;
 
 use apache_avro::{Writer as AvroWriter, to_value};
 use bytes::Bytes;
-use itertools::Itertools;
 use serde_json::to_vec;
 
 use super::{
@@ -215,7 +214,11 @@ impl ManifestWriter {
             .map(|f| PartitionFieldStats::new(f.field_type.as_primitive_type().unwrap().clone()))
             .collect();
         for partition in self.manifest_entries.iter().map(|e| &e.data_file.partition) {
-            for (literal, stat) in partition.iter().zip_eq(field_stats.iter_mut()) {
+            // Use zip() instead of zip_eq() to handle global equality delete files, which
+            // have an empty partition struct (0 fields) even when the manifest was created
+            // with a partitioned spec. zip() terminates at the shorter iterator, so global
+            // deletes simply contribute no partition bounds — which is correct per spec.
+            for (literal, stat) in partition.iter().zip(field_stats.iter_mut()) {
                 let primitive_literal = literal.map(|v| v.as_primitive_literal().unwrap());
                 stat.update(primitive_literal)?;
             }

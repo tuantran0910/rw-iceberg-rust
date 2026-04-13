@@ -34,6 +34,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::snapshot::SnapshotProduceOperation;
 use crate::transaction::{ActionCommit, TransactionAction};
+use crate::utils::{DEFAULT_LOAD_CONCURRENCY_LIMIT, load_manifests};
 
 /// Transaction action for rewriting files.
 pub struct OverwriteFilesAction {
@@ -262,9 +263,13 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
 
         let mut existing_files = Vec::new();
 
-        for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file.load_manifest(file_io_ref).await?;
+        // Load all manifests in parallel
+        let manifest_files: Vec<_> = manifest_list.entries().to_vec();
+        let loaded =
+            load_manifests(file_io_ref, manifest_files, DEFAULT_LOAD_CONCURRENCY_LIMIT).await?;
 
+        // Process manifests sequentially (ManifestWriter is stateful)
+        for (manifest_file, manifest) in &loaded {
             let found_deleted_files: HashSet<_> = manifest
                 .entries()
                 .iter()

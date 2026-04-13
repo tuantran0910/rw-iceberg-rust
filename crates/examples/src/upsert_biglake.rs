@@ -18,9 +18,9 @@
 //! Upsert example using BigLake metastore.
 //!
 //! This example demonstrates:
-//!  1. Creating a table with initial records
-//!  2. Running a Copy-on-Write upsert (10K upsert records into 100K existing records)
-//!  3. Measuring the time taken for the upsert operation
+//!  1. Creating a partitioned table with initial records
+//!  2. Running multiple upsert rounds using either Copy-on-Write or Merge-on-Read
+//!  3. Validating that the final record count and probe record are correct
 //!
 //! # Usage
 //!
@@ -28,8 +28,13 @@
 //! # Set up GCP credentials for BigLake
 //! export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 //!
-//! # Run the example
+//! # Run with Merge-on-Read (default)
 //! cargo run --example upsert-biglake
+//!
+//! # Run with Copy-on-Write
+//! UPSERT_WRITE_MODE=cow cargo run --example upsert-biglake
+//!
+//! # Accepted values for UPSERT_WRITE_MODE: "mor", "merge-on-read", "cow", "copy-on-write"
 //! ```
 
 use std::collections::HashMap;
@@ -40,8 +45,12 @@ use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use gcloud_auth::project::Config;
 use gcloud_auth::token::DefaultTokenSourceProvider;
+use iceberg::arrow::record_batch_partition_splitter::RecordBatchPartitionSplitter;
 use iceberg::expr::{BinaryExpression, Predicate, PredicateOperator, Reference};
-use iceberg::spec::{Datum, NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{
+    Datum, NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type,
+    UnboundPartitionField, UnboundPartitionSpec,
+};
 use iceberg::upsert::{UpsertConfig, UpsertWriteMode, upsert};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -49,6 +58,8 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::partitioning::PartitioningWriter;
+use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_rest::{
@@ -73,13 +84,13 @@ static BQ_CONNECTION: &str =
 static USER_PROJECT_HEADER: &str = "x-goog-user-project";
 
 static NAMESPACE_NAME: &str = "test_iceberg_upsert";
-static TABLE_NAME: &str = "upsert_demo_v5";
+static TABLE_NAME: &str = "upsert_demo_partitioned";
 
 // ===== Benchmark configuration =====
 
-const INITIAL_RECORDS: usize = 1_000;
-const UPSERT_BATCH_SIZE: usize = 100;
-const UPSERT_ROUNDS: usize = 2;
+const INITIAL_RECORDS: usize = 2_000_000;
+const UPSERT_BATCH_SIZE: usize = 1000;
+const UPSERT_ROUNDS: usize = 5;
 // How many of the upsert records have keys that already exist in the initial data
 const UPSERT_MATCH_RATIO: f32 = 0.9; // 90% update, 10% insert
 
@@ -93,9 +104,26 @@ fn build_table_schema() -> Schema {
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
             NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
             NestedField::optional(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+            // Region column for partitioning (field ID 4)
+            NestedField::required(4, "region", Type::Primitive(PrimitiveType::String)).into(),
         ])
         .with_schema_id(0)
         .with_identifier_field_ids(vec![1]) // id is the join key
+        .build()
+        .unwrap()
+}
+
+fn build_partition_spec(schema: &Schema) -> PartitionSpec {
+    PartitionSpec::builder(schema.clone())
+        .add_unbound_fields(vec![
+            UnboundPartitionField::builder()
+                .source_id(4) // region field ID
+                .name("region".to_string())
+                .transform(Transform::Identity)
+                .build(),
+        ])
+        .unwrap()
+        .with_spec_id(0)
         .build()
         .unwrap()
 }
@@ -113,6 +141,10 @@ fn arrow_schema() -> ArrowSchema {
         Field::new("value", DataType::Utf8, true).with_metadata(HashMap::from([(
             PARQUET_FIELD_ID_META_KEY.to_string(),
             "3".to_string(),
+        )])),
+        Field::new("region", DataType::Utf8, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "4".to_string(),
         )])),
     ])
 }
@@ -139,11 +171,24 @@ fn generate_initial_batch(n: usize, start_id: i64) -> RecordBatch {
         .map(|_| random_string(rand::thread_rng().gen_range(16..64)))
         .collect();
 
+    // Generate random region values for partitioning
+    let regions: Vec<String> = (0..n)
+        .map(|_| {
+            let r = rand::thread_rng().gen_range(0..3);
+            match r {
+                0 => "US".to_string(),
+                1 => "EU".to_string(),
+                _ => "ASIA".to_string(),
+            }
+        })
+        .collect();
+
     let schema = Arc::new(arrow_schema());
     RecordBatch::try_new(schema, vec![
         Arc::new(Int64Array::from(ids)),
         Arc::new(StringArray::from(names)),
         Arc::new(StringArray::from(values)),
+        Arc::new(StringArray::from(regions)),
     ])
     .unwrap()
 }
@@ -170,11 +215,24 @@ fn generate_upsert_batch(n: usize, existing_ids: &[i64], match_ratio: f32) -> Re
         .map(|_| random_string(rand::thread_rng().gen_range(16..64)))
         .collect();
 
+    // Generate random region values for partitioning
+    let regions: Vec<String> = (0..n)
+        .map(|_| {
+            let r = rand::thread_rng().gen_range(0..3);
+            match r {
+                0 => "US".to_string(),
+                1 => "EU".to_string(),
+                _ => "ASIA".to_string(),
+            }
+        })
+        .collect();
+
     let schema = Arc::new(arrow_schema());
     RecordBatch::try_new(schema, vec![
         Arc::new(Int64Array::from(ids)),
         Arc::new(StringArray::from(names)),
         Arc::new(StringArray::from(values)),
+        Arc::new(StringArray::from(regions)),
     ])
     .unwrap()
 }
@@ -217,46 +275,56 @@ async fn write_initial_data(
 
     let location_generator = DefaultLocationGenerator::new(metadata.clone())?;
 
-    let mut all_files: Vec<iceberg::spec::DataFile> = Vec::new();
+    // Get the default partition spec - if the table is partitioned, use FanoutWriter
+    let partition_spec = metadata.default_partition_spec();
 
-    // Write batches to separate files (no rolling - each batch = one file)
-    // This creates ~100 small files (batch_size=10K, so 2M/10K = 200 files)
-    // To get ~100 files, we group every 2 batches together
-    let batches_per_file = 2;
-    for (file_idx, chunk) in batches.chunks(batches_per_file).enumerate() {
-        let file_name_generator = DefaultFileNameGenerator::new(
-            format!("init-{file_idx:03}"),
-            Some(Uuid::now_v7().to_string()),
-            iceberg::spec::DataFileFormat::Parquet,
-        );
+    let file_name_generator = DefaultFileNameGenerator::new(
+        "init".to_string(),
+        Some(Uuid::now_v7().to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
 
-        let parquet_writer_builder =
-            ParquetWriterBuilder::new(WriterProperties::default(), schema.clone());
+    let parquet_writer_builder =
+        ParquetWriterBuilder::new(WriterProperties::default(), schema.clone());
 
-        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-            parquet_writer_builder,
-            file_io.clone(),
-            location_generator.clone(),
-            file_name_generator,
-        );
+    let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
+        file_io.clone(),
+        location_generator.clone(),
+        file_name_generator,
+    );
 
-        let writer: DataFileWriterBuilder<
-            ParquetWriterBuilder,
-            DefaultLocationGenerator,
-            DefaultFileNameGenerator,
-        > = DataFileWriterBuilder::new(rolling_writer_builder);
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
-        let mut writer = writer.build(None).await?;
+    // If table is partitioned, use FanoutWriter with RecordBatchPartitionSplitter
+    if !partition_spec.is_unpartitioned() {
+        let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+            schema.clone(),
+            std::sync::Arc::new(partition_spec.as_ref().clone()),
+        )?;
 
-        for batch in chunk {
-            writer.write(batch.clone()).await?;
+        let mut fanout_writer = FanoutWriter::new(data_file_writer_builder);
+
+        for batch in &batches {
+            let partitioned = splitter.split(batch)?;
+            for (partition_key, partitioned_batch) in partitioned {
+                fanout_writer
+                    .write(partition_key, partitioned_batch)
+                    .await?;
+            }
         }
 
-        let files = writer.close().await?;
-        all_files.extend(files);
+        return fanout_writer.close().await.map_err(anyhow::Error::from);
     }
 
-    Ok(all_files)
+    // Unpartitioned case: write directly with single writer
+    let mut writer = data_file_writer_builder.build(None).await?;
+
+    for batch in &batches {
+        writer.write(batch.clone()).await?;
+    }
+
+    writer.close().await.map_err(anyhow::Error::from)
 }
 
 async fn commit_initial_data(
@@ -350,6 +418,18 @@ async fn main() -> anyhow::Result<()> {
         .try_init()
         .ok();
 
+    // Resolve write mode from UPSERT_WRITE_MODE env var.
+    // Accepted values: "cow" / "copy-on-write"  or  "mor" / "merge-on-read" (default).
+    let write_mode_str = std::env::var("UPSERT_WRITE_MODE").unwrap_or_else(|_| "mor".to_string());
+    let write_mode = UpsertWriteMode::try_from(write_mode_str.as_str()).unwrap_or_else(|_| {
+        eprintln!("Unknown UPSERT_WRITE_MODE '{write_mode_str}', falling back to 'mor'");
+        UpsertWriteMode::MergeOnRead
+    });
+    let write_mode_label = match write_mode {
+        UpsertWriteMode::CopyOnWrite => "Copy-on-Write",
+        UpsertWriteMode::MergeOnRead => "Merge-on-Read",
+    };
+
     println!("==========================================");
     println!("BigLake Upsert Benchmark Example");
     println!("==========================================");
@@ -359,6 +439,7 @@ async fn main() -> anyhow::Result<()> {
     println!("  Upsert batch size:   {UPSERT_BATCH_SIZE}");
     println!("  Upsert rounds:       {UPSERT_ROUNDS}");
     println!("  Match ratio:         {:.0}%", UPSERT_MATCH_RATIO * 100.0);
+    println!("  Write mode:          {write_mode_label}");
     println!();
 
     // ----- Step 1: Get GCS token via ADC and connect to catalog -----
@@ -415,13 +496,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let table_schema = build_table_schema();
+    let partition_spec = build_partition_spec(&table_schema);
     let table_creation = TableCreation::builder()
         .name(table_ident.name.clone())
         .schema(table_schema.clone())
-        .properties(HashMap::from([(
-            "bq_connection".to_string(),
-            BQ_CONNECTION.to_string(),
-        )]))
+        .partition_spec(UnboundPartitionSpec::from(partition_spec))
+        .properties(HashMap::from([
+            ("bq_connection".to_string(), BQ_CONNECTION.to_string()),
+            (
+                "commit.manifest-merge.enabled".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "commit.manifest.min-count-to-merge".to_string(),
+                "10".to_string(),
+            ),
+            (
+                "commit.manifest.target-size-bytes".to_string(),
+                "8388608".to_string(),
+            ),
+        ]))
         .build();
 
     let table = catalog
@@ -453,15 +547,15 @@ async fn main() -> anyhow::Result<()> {
     );
     println!();
 
-    // ----- Step 5: Run multiple upsert rounds (Merge-on-Read) -----
+    // ----- Step 5: Run multiple upsert rounds -----
     println!(
-        "[5/5] Running {UPSERT_ROUNDS} Merge-on-Read upsert rounds ({UPSERT_BATCH_SIZE} records each)..."
+        "[5/5] Running {UPSERT_ROUNDS} {write_mode_label} upsert rounds ({UPSERT_BATCH_SIZE} records each)..."
     );
     println!();
 
     let config = UpsertConfig {
-        join_columns: vec!["id".to_string()], // explicit join key
-        write_mode: UpsertWriteMode::MergeOnRead,
+        join_columns: vec!["id".to_string()],
+        write_mode,
         skip_unchanged: true,
         pruning_predicate: None,
     };
@@ -502,7 +596,8 @@ async fn main() -> anyhow::Result<()> {
         // 90% update, 10% insert
 
         let start = Instant::now();
-        let (updated_table, result) = upsert(&table, &catalog, upsert_batch, config.clone()).await?;
+        let (updated_table, result) =
+            upsert(&table, &catalog, upsert_batch, config.clone()).await?;
         table = updated_table;
         let elapsed = start.elapsed();
         total_upsert_time += elapsed;
