@@ -17,6 +17,17 @@
 
 //! Key resolution, source validation, and pruning predicate construction for upsert.
 
+/// Maximum number of distinct values in an IN-list predicate before falling back to a
+/// bounding-box predicate.
+///
+/// This matches `IN_PREDICATE_LIMIT` in `InclusiveMetricsEvaluator`: when an IN predicate
+/// has more than 1000 literals the evaluator short-circuits to `ROWS_MIGHT_MATCH` for every
+/// file, providing zero pruning benefit.
+///
+/// Increased from 200 to 1000 to improve file pruning for upsert workloads with larger
+/// batches. IN-list predicates provide much tighter pruning than bounding-box.
+const IN_PREDICATE_LIMIT: usize = 1000;
+
 use std::collections::HashSet;
 
 use arrow_arith::aggregate::{max_string, min_string};
@@ -195,18 +206,78 @@ pub fn validate_source_keys(source: &RecordBatch, key_column_indices: &[usize]) 
     Ok(())
 }
 
-/// Build a bounding-box pruning predicate from the source batch's key column values.
+/// Build an IN-list predicate for a single column.
 ///
-/// For each key column computes `min` and `max` and produces:
-/// `(col >= min AND col <= max) AND ...`
+/// Extracts every distinct non-null value and returns `col IN (v1, v2, …)`.
+/// Returns `None` when:
+/// - the column type is unsupported (no `Datum` conversion available),
+/// - the number of distinct values exceeds [`IN_PREDICATE_LIMIT`], or
+/// - the column contains only nulls.
+fn build_in_list_column_predicate(col_name: &str, col: &dyn Array) -> Result<Option<Predicate>> {
+    macro_rules! int_in_list {
+        ($array_type:ty, $datum_fn:expr) => {{
+            let arr = col
+                .as_any()
+                .downcast_ref::<PrimitiveArray<$array_type>>()
+                .unwrap();
+            let mut datums: HashSet<Datum> = HashSet::new();
+            for i in 0..arr.len() {
+                if arr.is_valid(i) {
+                    datums.insert($datum_fn(arr.value(i)));
+                    if datums.len() > IN_PREDICATE_LIMIT {
+                        return Ok(None);
+                    }
+                }
+            }
+            if datums.is_empty() {
+                return Ok(None); // all-null column
+            }
+            Ok(Some(Reference::new(col_name).is_in(datums)))
+        }};
+    }
+
+    match col.data_type() {
+        DataType::Int8 => int_in_list!(Int8Type, |v: i8| Datum::int(v as i32)),
+        DataType::Int16 => int_in_list!(Int16Type, |v: i16| Datum::int(v as i32)),
+        DataType::Int32 => int_in_list!(Int32Type, |v: i32| Datum::int(v)),
+        DataType::Int64 => int_in_list!(Int64Type, |v: i64| Datum::long(v)),
+        DataType::UInt8 => int_in_list!(UInt8Type, |v: u8| Datum::int(v as i32)),
+        DataType::UInt16 => int_in_list!(UInt16Type, |v: u16| Datum::int(v as i32)),
+        DataType::UInt32 => int_in_list!(UInt32Type, |v: u32| Datum::long(v as i64)),
+        DataType::UInt64 => int_in_list!(UInt64Type, |v: u64| Datum::long(v as i64)),
+        DataType::Date32 => int_in_list!(Date32Type, |v: i32| Datum::date(v)),
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            let arr = match col.as_any().downcast_ref::<StringArray>() {
+                Some(a) => a,
+                None => return Ok(None),
+            };
+            let mut datums: HashSet<Datum> = HashSet::new();
+            for i in 0..arr.len() {
+                if arr.is_valid(i) {
+                    datums.insert(Datum::string(arr.value(i)));
+                    if datums.len() > IN_PREDICATE_LIMIT {
+                        return Ok(None);
+                    }
+                }
+            }
+            if datums.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(Reference::new(col_name).is_in(datums)))
+        }
+        _ => Ok(None), // unsupported type — no pruning for this column
+    }
+}
+
+/// Primary predicate builder for upsert: uses IN-list for ≤[`IN_PREDICATE_LIMIT`] distinct
+/// key values per column, falling back to bounding-box for larger key sets.
 ///
-/// This is intentionally coarser than an exact `IN(...)` predicate but avoids the
-/// O(n×m) expression tree explosion that PyIceberg suffers from.  The scan's
-/// [`InclusiveMetricsEvaluator`] and manifest partition evaluator will use these
-/// bounds to skip files that cannot contain any matching rows.
+/// An exact IN list lets the [`InclusiveMetricsEvaluator`] skip files whose value ranges
+/// do not intersect any of the listed keys (not just the min/max bounding box).
+/// Row-group filtering benefits similarly.
 ///
-/// Returns `None` if the source batch is empty or no supported key types are found.
-pub fn build_pruning_predicate(
+/// Returns `None` if the source batch is empty.
+pub fn build_optimal_predicate(
     source: &RecordBatch,
     key_columns: &[KeyColumn],
 ) -> Result<Option<Predicate>> {
@@ -218,7 +289,13 @@ pub fn build_pruning_predicate(
 
     for key_col in key_columns {
         let col = source.column(key_col.schema_index);
-        let col_pred = build_column_predicate(key_col.name.as_str(), col.as_ref())?;
+
+        // Try IN-list first; if None (too many values or unsupported type) fall back to bounds.
+        let col_pred = match build_in_list_column_predicate(key_col.name.as_str(), col.as_ref())? {
+            Some(p) => Some(p),
+            None => build_column_predicate(key_col.name.as_str(), col.as_ref())?,
+        };
+
         if let Some(p) = col_pred {
             predicate = Some(match predicate {
                 None => p,
@@ -228,123 +305,10 @@ pub fn build_pruning_predicate(
     }
 
     if let Some(ref p) = predicate {
-        debug!(predicate = %p, key_columns = key_columns.iter().map(|k| k.name.as_str()).collect::<Vec<_>>().join(","), source_rows = source.num_rows(), "Built pruning predicate for upsert");
+        debug!(predicate = %p, key_columns = key_columns.iter().map(|k| k.name.as_str()).collect::<Vec<_>>().join(","), source_rows = source.num_rows(), "Built optimal pruning predicate for upsert");
     }
 
     Ok(predicate)
-}
-
-/// Builds a pruning predicate for upsert that focuses on INSERT-key ranges.
-///
-/// Unlike [`build_pruning_predicate`] which builds a predicate for ALL source keys,
-/// this function identifies the subset of keys that are likely INSERT operations
-/// (keys that don't exist in the existing table) and builds a tighter predicate
-/// for just those keys.
-///
-/// The strategy:
-/// - Sort source key values and look for a natural "gap" in the distribution
-/// - Keys above the gap are considered likely INSERT keys
-/// - Build predicate from insert-range only: `(id >= min_insert AND id <= max_insert)`
-/// - For updates, all files must be scanned (unavoidable without pre-scan)
-///
-/// Returns `None` if the source batch is too small, no supported key types are found,
-/// or no clear INSERT range is identified (which means fall back to standard predicate).
-pub fn build_upsert_predicate(
-    source: &RecordBatch,
-    key_columns: &[KeyColumn],
-) -> Result<Option<Predicate>> {
-    if source.num_rows() < 2 {
-        return Ok(None);
-    }
-
-    // For now, we work with the first key column only (composite keys would need more complex logic)
-    let key_col = key_columns
-        .first()
-        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "No key columns provided"))?;
-
-    let col = source.column(key_col.schema_index);
-
-    // Try to find INSERT range by looking at upper portion of sorted keys
-    let insert_range = find_insert_key_range(col)?;
-
-    if let Some((min_insert, max_insert)) = insert_range {
-        let reference = Reference::new(key_col.name.as_str());
-        let min_clone = min_insert.clone();
-        let max_clone = max_insert.clone();
-
-        // Build predicate: key >= min_insert AND key <= max_insert
-        let predicate = reference
-            .clone()
-            .greater_than_or_equal_to(min_insert)
-            .and(reference.less_than_or_equal_to(max_insert));
-
-        debug!(predicate = %predicate, key_column = %key_col.name, min_insert = %format!("{:?}", min_clone), max_insert = %format!("{:?}", max_clone), source_rows = source.num_rows(), "Built upsert predicate for insert-key range");
-        return Ok(Some(predicate));
-    }
-
-    Ok(None)
-}
-
-/// Finds the INSERT key range by detecting a gap in sorted key values.
-///
-/// For data like [1,2,3,100,101,102], there's a large gap between 3 and 100.
-/// Keys above the gap (100,101,102) are considered INSERT candidates.
-///
-/// For uniformly distributed data like [1,2,3,4,5,6], there's no significant gap,
-/// so this returns None (fall back to standard predicate).
-fn find_insert_key_range(col: &dyn Array) -> Result<Option<(Datum, Datum)>> {
-    use arrow_array::types::*;
-
-    macro_rules! int_insert_range {
-        ($array_type:ty, $datum_fn:expr) => {{
-            let arr = match col.as_any().downcast_ref::<PrimitiveArray<$array_type>>() {
-                Some(a) => a,
-                None => return Ok(None),
-            };
-            let max_val = match arrow_arith::aggregate::max(arr) {
-                Some(v) => v,
-                None => return Ok(None),
-            };
-            let n = arr.len();
-            if n < 4 {
-                return Ok(None);
-            }
-            // Collect values and sort to find gap
-            let mut values: Vec<_> = arr.iter().filter_map(|v| v).collect();
-            if values.len() < 4 {
-                return Ok(None);
-            }
-            values.sort();
-            // Find largest gap between consecutive values
-            let mut max_gap: f64 = 0.0;
-            let mut gap_start_idx = 0;
-            let range = *values.last().unwrap() as f64 - *values.first().unwrap() as f64;
-
-            for i in 1..values.len() {
-                let gap = values[i] as f64 - values[i - 1] as f64;
-                // Gap is significant if it's more than 20% of total range
-                if gap > max_gap && range > 0.0 && gap / range > 0.2 {
-                    max_gap = gap;
-                    gap_start_idx = i;
-                }
-            }
-            // If we found a significant gap, use upper cluster as insert range
-            if max_gap > 0.0 {
-                Some(($datum_fn(values[gap_start_idx]), $datum_fn(max_val)))
-            } else {
-                None
-            }
-        }};
-    }
-
-    Ok(match col.data_type() {
-        DataType::Int32 => int_insert_range!(Int32Type, |v: i32| Datum::int(v)),
-        DataType::Int64 => int_insert_range!(Int64Type, |v: i64| Datum::long(v)),
-        DataType::UInt32 => int_insert_range!(UInt32Type, |v: u32| Datum::int(v as i32)),
-        DataType::UInt64 => int_insert_range!(UInt64Type, |v: u64| Datum::long(v as i64)),
-        // For strings, skip insert optimization (too complex to determine insert range)
-        _ => None,
-    })
 }
 
 /// Build a `col >= min AND col <= max` predicate for a single column.
@@ -503,80 +467,5 @@ mod tests {
         let result = validate_source_keys(&batch, &[0]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("duplicate key"));
-    }
-
-    #[test]
-    fn test_build_pruning_predicate_int32() {
-        let schema = test_schema();
-        let keys = resolve_key_columns(&schema, &[]).unwrap();
-        let batch = make_batch(vec![5, 10, 3], vec![None, None, None], vec![
-            None, None, None,
-        ]);
-        let pred = build_pruning_predicate(&batch, &keys).unwrap();
-        assert!(pred.is_some());
-        let p = pred.unwrap();
-        let s = format!("{p:?}");
-        // Should be a range predicate
-        assert!(s.contains("id") || s.contains("3") || s.contains("10"));
-    }
-
-    #[test]
-    fn test_build_pruning_predicate_empty_source() {
-        let schema = test_schema();
-        let keys = resolve_key_columns(&schema, &[]).unwrap();
-        let batch = make_batch(vec![], vec![], vec![]);
-        let pred = build_pruning_predicate(&batch, &keys).unwrap();
-        assert!(pred.is_none());
-    }
-
-    #[test]
-    fn test_build_upsert_predicate_insert_only() {
-        // Test case where source has keys with clear insert range
-        // Keys [1, 2, 3, 100, 101, 102] - upper quartile (100, 101, 102) should be insert candidates
-        let schema = test_schema();
-        let keys = resolve_key_columns(&schema, &[]).unwrap();
-        let batch = make_batch(
-            vec![1, 2, 3, 100, 101, 102],
-            vec![None, None, None, None, None, None],
-            vec![None, None, None, None, None, None],
-        );
-        let pred = build_upsert_predicate(&batch, &keys).unwrap();
-        assert!(
-            pred.is_some(),
-            "Expected Some predicate for insert-only keys"
-        );
-        let p = pred.unwrap();
-        let s = format!("{p:?}");
-        // Predicate should reference 'id' and have range for insert keys
-        assert!(s.contains("id"), "Predicate should reference id column");
-    }
-
-    #[test]
-    fn test_build_upsert_predicate_mixed() {
-        // Test case where source has uniformly distributed keys (no clear insert range)
-        // Keys [1, 2, 3, 4, 5, 6] - uniform distribution, no clear gap
-        let schema = test_schema();
-        let keys = resolve_key_columns(&schema, &[]).unwrap();
-        let batch = make_batch(
-            vec![1, 2, 3, 4, 5, 6],
-            vec![None, None, None, None, None, None],
-            vec![None, None, None, None, None, None],
-        );
-        let pred = build_upsert_predicate(&batch, &keys).unwrap();
-        // Uniform distribution should return None (fall back to standard predicate)
-        assert!(
-            pred.is_none(),
-            "Expected None for uniformly distributed keys"
-        );
-    }
-
-    #[test]
-    fn test_build_upsert_predicate_small_batch() {
-        // Test that small batches (less than 4 rows) return None
-        let schema = test_schema();
-        let keys = resolve_key_columns(&schema, &[]).unwrap();
-        let batch = make_batch(vec![1, 2], vec![None, None], vec![None, None]);
-        let pred = build_upsert_predicate(&batch, &keys).unwrap();
-        assert!(pred.is_none(), "Expected None for small batch");
     }
 }

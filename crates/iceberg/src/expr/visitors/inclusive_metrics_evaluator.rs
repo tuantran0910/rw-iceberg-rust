@@ -22,7 +22,7 @@ use crate::expr::{BoundPredicate, BoundReference};
 use crate::spec::{DataFile, Datum, PrimitiveLiteral};
 use crate::{Error, ErrorKind};
 
-const IN_PREDICATE_LIMIT: usize = 200;
+const IN_PREDICATE_LIMIT: usize = 1000;
 const ROWS_MIGHT_MATCH: crate::Result<bool> = Ok(true);
 const ROWS_CANNOT_MATCH: crate::Result<bool> = Ok(false);
 
@@ -1541,7 +1541,7 @@ mod test {
         .unwrap();
         assert!(result, "Should read: in on no nulls column");
 
-        let ids = (-400..=0).collect::<Vec<_>>();
+        let ids = (-1200..=0).collect::<Vec<_>>();
         let result =
             InclusiveMetricsEvaluator::eval(&r#in_int("id", &ids), &get_test_file_1(), true)
                 .unwrap();

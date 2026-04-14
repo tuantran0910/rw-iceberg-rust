@@ -88,9 +88,9 @@ static TABLE_NAME: &str = "upsert_demo_partitioned";
 
 // ===== Benchmark configuration =====
 
-const INITIAL_RECORDS: usize = 2_000_000;
+const INITIAL_RECORDS: usize = 100_000;
 const UPSERT_BATCH_SIZE: usize = 1000;
-const UPSERT_ROUNDS: usize = 5;
+const UPSERT_ROUNDS: usize = 10;
 // How many of the upsert records have keys that already exist in the initial data
 const UPSERT_MATCH_RATIO: f32 = 0.9; // 90% update, 10% insert
 

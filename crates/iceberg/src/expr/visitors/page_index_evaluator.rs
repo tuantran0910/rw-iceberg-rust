@@ -33,7 +33,7 @@ use crate::{Error, ErrorKind, Result};
 
 type OffsetIndex = Vec<OffsetIndexMetaData>;
 
-const IN_PREDICATE_LIMIT: usize = 200;
+const IN_PREDICATE_LIMIT: usize = 1000;
 
 enum MissingColBehavior {
     CantMatch,
@@ -1290,7 +1290,7 @@ mod tests {
         let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
 
         let filter = Reference::new("col_float")
-            .is_in(std::iter::repeat_with(|| Datum::float(rng.gen_range(0.0..10.0))).take(1000))
+            .is_in(std::iter::repeat_with(|| Datum::float(rng.gen_range(0.0..10.0))).take(1500))
             .bind(iceberg_schema_ref.clone(), false)?;
 
         let result = PageIndexEvaluator::eval(

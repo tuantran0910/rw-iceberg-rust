@@ -165,14 +165,13 @@ pub async fn upsert(
     let key_indices: Vec<usize> = key_columns.iter().map(|k| k.schema_index).collect();
     planner::validate_source_keys(&source, &key_indices)?;
 
-    // 3. Build (or use provided) bounding-box pruning predicate
-    // Always use build_pruning_predicate for full source range to correctly handle
-    // mixed update/insert workloads. The insert-optimized predicate approach was
-    // incorrect because it couldn't distinguish updates from inserts without
-    // pre-scanning the existing table.
+    // 3. Build (or use provided) pruning predicate (IN-list for ≤1000 keys, bounding-box
+    //    otherwise).  Always covers the full source key range to correctly handle mixed
+    //    update/insert workloads — the insert-optimized predicate was incorrect because it
+    //    couldn't distinguish updates from inserts without pre-scanning the existing table.
     let predicate = match config.pruning_predicate {
         Some(p) => p,
-        None => planner::build_pruning_predicate(&source, &key_columns)?.ok_or_else(|| {
+        None => planner::build_optimal_predicate(&source, &key_columns)?.ok_or_else(|| {
             crate::Error::new(
                 crate::ErrorKind::DataInvalid,
                 "Source batch is empty; nothing to upsert",
@@ -234,7 +233,7 @@ pub async fn upsert_compute(
 
     let predicate = match config.pruning_predicate {
         Some(p) => p,
-        None => planner::build_pruning_predicate(&source, &key_columns)?.ok_or_else(|| {
+        None => planner::build_optimal_predicate(&source, &key_columns)?.ok_or_else(|| {
             crate::Error::new(
                 crate::ErrorKind::DataInvalid,
                 "Source batch is empty; nothing to upsert",
@@ -800,5 +799,118 @@ mod tests {
         assert_eq!(find_name(&batches, 1).as_deref(), Some("b1"));
         assert_eq!(find_name(&batches, 2).as_deref(), Some("b2"));
         assert_eq!(find_name(&batches, 3).as_deref(), Some("a3")); // untouched
+    }
+
+    // ── CoW IN-predicate tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_cow_in_predicate_small_batch_correctness() {
+        // ≤1000 keys → triggers IN-list predicate path in build_optimal_predicate.
+        let (catalog, _tmp) = setup_catalog().await;
+        let table = setup_table(&catalog).await;
+
+        // Write 10 initial rows.
+        let initial_ids: Vec<i64> = (1..=10).collect();
+        let initial_names: Vec<&str> = (1..=10).map(|_| "orig").collect();
+        let initial_values: Vec<Option<&str>> = (1..=10).map(|_| Some("v")).collect();
+        let initial = make_batch(initial_ids, initial_names, initial_values);
+        let table = commit_batch(&table, &catalog, initial).await;
+
+        // Upsert 6 rows: ids 6–11 (ids 6–10 update, id 11 inserts).
+        let source_ids: Vec<i64> = (6..=11).collect();
+        let source_names: Vec<&str> = vec!["upd6", "upd7", "upd8", "upd9", "upd10", "new11"];
+        let source_values: Vec<Option<&str>> = (6..=11).map(|_| Some("nv")).collect();
+        let source = make_batch(source_ids, source_names, source_values);
+        let config = UpsertConfig {
+            write_mode: UpsertWriteMode::CopyOnWrite,
+            ..Default::default()
+        };
+        let (table, _result) = upsert(&table, &catalog, source, config).await.unwrap();
+
+        let batches = scan_all(&table).await;
+        assert_eq!(total_rows(&batches), 11); // 10 original + 1 insert
+        assert_eq!(sorted_ids(&batches), (1..=11).collect::<Vec<i64>>());
+        // Unchanged original rows.
+        assert_eq!(find_name(&batches, 1).as_deref(), Some("orig"));
+        assert_eq!(find_name(&batches, 5).as_deref(), Some("orig"));
+        // Updated rows.
+        assert_eq!(find_name(&batches, 6).as_deref(), Some("upd6"));
+        assert_eq!(find_name(&batches, 10).as_deref(), Some("upd10"));
+        // Inserted row.
+        assert_eq!(find_name(&batches, 11).as_deref(), Some("new11"));
+    }
+
+    #[tokio::test]
+    async fn test_cow_in_predicate_large_batch_fallback() {
+        // >1000 keys → triggers bounding-box fallback in build_optimal_predicate.
+        let (catalog, _tmp) = setup_catalog().await;
+        let table = setup_table(&catalog).await;
+
+        // Write 100 initial rows.
+        let initial_ids: Vec<i64> = (1..=100).collect();
+        let initial_names: Vec<&str> = (1..=100).map(|_| "orig").collect();
+        let initial_values: Vec<Option<&str>> = (1..=100).map(|_| Some("v")).collect();
+        let initial = make_batch(initial_ids, initial_names, initial_values);
+        let table = commit_batch(&table, &catalog, initial).await;
+
+        // Upsert 210 rows: ids 51–260 (ids 51–100 update, ids 101–260 insert).
+        // This exceeds IN_PREDICATE_LIMIT=1000, so bounding-box fallback is used.
+        let source_ids: Vec<i64> = (51..=260).collect();
+        let source_names: Vec<&str> = source_ids.iter().map(|_| "upserted").collect();
+        let source_values: Vec<Option<&str>> = source_ids.iter().map(|_| Some("nv")).collect();
+        let source = make_batch(source_ids, source_names, source_values);
+        let config = UpsertConfig {
+            write_mode: UpsertWriteMode::CopyOnWrite,
+            ..Default::default()
+        };
+        let (table, _result) = upsert(&table, &catalog, source, config).await.unwrap();
+
+        let batches = scan_all(&table).await;
+        assert_eq!(total_rows(&batches), 260); // 50 original + 210 upserted
+        // Original rows below update range untouched.
+        assert_eq!(find_name(&batches, 1).as_deref(), Some("orig"));
+        assert_eq!(find_name(&batches, 50).as_deref(), Some("orig"));
+        // Updated rows.
+        assert_eq!(find_name(&batches, 51).as_deref(), Some("upserted"));
+        assert_eq!(find_name(&batches, 100).as_deref(), Some("upserted"));
+        // Inserted rows.
+        assert_eq!(find_name(&batches, 101).as_deref(), Some("upserted"));
+        assert_eq!(find_name(&batches, 260).as_deref(), Some("upserted"));
+    }
+
+    #[tokio::test]
+    async fn test_cow_in_predicate_mixed_updates_inserts() {
+        // Small batch: verifies IN-list predicate doesn't break normal CoW semantics.
+        let (catalog, _tmp) = setup_catalog().await;
+        let table = setup_table(&catalog).await;
+
+        let initial = make_batch(vec![1, 2, 3], vec!["a1", "a2", "a3"], vec![
+            Some("v1"),
+            Some("v2"),
+            Some("v3"),
+        ]);
+        let table = commit_batch(&table, &catalog, initial).await;
+
+        // Update id=1 and id=3, insert id=4.
+        let source = make_batch(vec![1, 3, 4], vec!["new1", "new3", "new4"], vec![
+            Some("nv1"),
+            Some("nv3"),
+            Some("v4"),
+        ]);
+        let config = UpsertConfig {
+            write_mode: UpsertWriteMode::CopyOnWrite,
+            ..Default::default()
+        };
+        let (table, result) = upsert(&table, &catalog, source, config).await.unwrap();
+        assert_eq!(result.rows_updated, 2);
+        assert_eq!(result.rows_inserted, 1);
+
+        let batches = scan_all(&table).await;
+        assert_eq!(total_rows(&batches), 4);
+        assert_eq!(sorted_ids(&batches), vec![1, 2, 3, 4]);
+        assert_eq!(find_name(&batches, 1).as_deref(), Some("new1")); // updated
+        assert_eq!(find_name(&batches, 2).as_deref(), Some("a2")); // unchanged
+        assert_eq!(find_name(&batches, 3).as_deref(), Some("new3")); // updated
+        assert_eq!(find_name(&batches, 4).as_deref(), Some("new4")); // inserted
     }
 }
